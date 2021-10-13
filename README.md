@@ -75,3 +75,7 @@ CASA <X>: import vis_tools
 CASA <X>: execfile('{}/CASA_vis_tools.py'.format(
               os.path.dirname(vis_tools.__file__)))
 ```
+
+## Example
+
+The script `example.py` shows an example of how to run `simobserve_phase`.
