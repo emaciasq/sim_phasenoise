@@ -101,32 +101,131 @@ def phase_rms(antbl, scale_prms = 1.0, nu_scale = None):
     return prms * scale_prms
 
 
-def baseline_arrayconf(fconf, refant):
-    """Reads an array configuration file and returns array of total distance
-    to reference antenna for each antenna.
+def baseline_arrayconf(fconf, refant = None):
+    """Reads an array configuration file and computes antenna distances to a
+    reference one.
 
     Args:
       fconf:
         Path to array configuration file (CASA format)
       refant:
-        Index of antenna reference, with respect to the antennas
-        in configuration file.
+        (optional) Index of antenna reference, with respect to the antennas
+        in configuration file. If not set, it will use the antenna that is
+        the farthest from the array center.
+
+    Returns:
+      Array with distance to a reference antenna for each antenna, and index of
+      reference antenna used.
+
     """
-    arrayconf = np.genfromtxt(fconf, skip_header=3, dtype=str)
+    f = open(fconf)
+    skip_header = 0
+    while f.readline()[0] == '#':
+        skip_header += 1
+    f.close()
+    arrayconf = np.genfromtxt(fconf, skip_header = skip_header, dtype = str)
     x = arrayconf[:,0].astype(float)
     y = arrayconf[:,1].astype(float)
     z = arrayconf[:,2].astype(float)
     # pad = arrayconf[:,4]
 
+    if refant == None:
+      refant = np.argmax(x**2. + y**2. + z**2.)
+
     baseline2ref = np.sqrt((x - x[refant])**2. + (y - y[refant])**2.
     + (z - z[refant])**2.)
 
-    return baseline2ref
+    return baseline2ref, refant
 
 
-def apply_phasenoise(visms, fconf, refant = 13, prms_0 = 1.0, nu_scale = None,
-                     prms_timescale = 1, apply = True, verbose = False,
-                     plots = False, rng = np.random.default_rng(2021)):
+def get_antpos_ms(visms):
+    """Gets the X and Y positions of the antennas in a measurement set.
+
+    Mostly copied from task_plotants.py.
+
+    Args:
+      visms:
+        Path to measurement set.
+
+    Returns:
+      Arrays with X and Y positions of the antennas, in m, and with respect to
+      the array center.
+    """
+    from casatools import table, quanta, measures, msmetadata
+    tb = table( )
+    me = measures( )
+    qa = quanta( )
+
+    # Getting array position in Wgs84
+    metadata = msmetadata()
+    metadata.open(visms)
+    telescope = metadata.observatorynames()[0]
+    arrayPos = metadata.observatoryposition()
+    metadata.close()
+    arrayWgs84 = me.measure(arrayPos, 'WGS84')
+    arrayLon, arrayLat, arrayAlt = [arrayWgs84[i]['value']
+            for i in ['m0','m1','m2']]
+
+    # Getting antenna positions
+    tb.open(visms + '/ANTENNA')
+    antPositions = np.array([me.position('ITRF', qa.quantity(x, 'm'),
+            qa.quantity(y, 'm'), qa.quantity(z, 'm'))
+            for (x, y, z) in tb.getcol('POSITION').transpose()])
+    tb.close()
+    # Filtering for the ones that are used
+    tb.open(visms)
+    ants1 = tb.getcol('ANTENNA1')
+    ants2 = tb.getcol('ANTENNA2')
+    tb.close()
+    antIdsUsed = list(set(np.append(ants1, ants2)))
+    antPositions = [antPositions[i] for i in antIdsUsed]
+    # Getting antenna positions in Wgs84
+    antWgs84s = np.array([me.measure(pos, 'WGS84') for pos in antPositions])
+
+    # Getting antenna positions from array center in m
+    antLons, antLats = [np.array( [pos[i]['value']
+        for pos in antWgs84s]) for i in ['m0','m1']]
+    radE = 6370000.
+    antXs = (antLons - arrayLon) * radE * np.cos(arrayLat)
+    antYs = (antLats - arrayLat) * radE
+
+    return antXs, antYs
+
+
+def baseline_ms(visms, refant = None):
+    """Reads antenna positions and returns distances to a reference one.
+
+    Note that it only uses x and y coordinates (i.e., it ignores distance
+    in z axis).
+
+    Args:
+      visms:
+        Path to measurement set.
+      refant:
+        (optional) Index of antenna reference, with respect to the antennas
+        in configuration file. If not set, it will use the antenna that is
+        the farthest from the array center.
+
+    Returns:
+      Array with distance to a reference antenna for each antenna, and index of
+      reference antenna used.
+    """
+    antXs, antYs = get_antpos_ms(visms)
+
+    if refant == None:
+        refant = np.argmax(antXs**2. + antYs**2.)
+
+    refX, refY = antXs[refant], antYs[refant]
+
+    baseline2ref = np.sqrt((antXs - refX)**2. + (antYs - refY)**2.)
+
+    return baseline2ref, refant
+
+
+def apply_phasenoise(visms, fconf = None, refant = None, prms_0 = 1.0,
+                     nu_scale = None, prms_timescale = 1, apply = True,
+                     verbose = False, plots = False,
+                     rng = np.random.default_rng(2021)):
     """Computes and applies atmospheric phase noise to a measurement set.
 
     Creates a copy of input MS with corrupted phases.
@@ -135,10 +234,13 @@ def apply_phasenoise(visms, fconf, refant = 13, prms_0 = 1.0, nu_scale = None,
       visms:
         Path to measurement set
       fconf:
-        Path to array configuration file (CASA format)
+        (optional) Path to array configuration file (CASA format) in case user
+        wants to use it to get antenna positions. If not given, it will read the
+        antenna positions directly from the measurement set.
       refant:
-        Index of antenna reference, with respect to the antennas
-        in configuration file. Default is 13.
+        (optional) Index of antenna reference, with respect to the antennas
+        in configuration file. If not set, it will use the antenna that is
+        the farthest from the array center.
       prms_0:
         (Optional) Factor to determine the phase rms at 10 km. It can be given
         as a float, in which case it will work as a factor scaling the phase
@@ -165,7 +267,11 @@ def apply_phasenoise(visms, fconf, refant = 13, prms_0 = 1.0, nu_scale = None,
       rng:
         Random number generator to be used (for reproducibility).
     """
-    baseline2ref = baseline_arrayconf(fconf, refant)
+    if fconf == None:
+        baseline2ref, refant = baseline_ms(visms)
+    else:
+        baseline2ref, refant = baseline_arrayconf(fconf, refant)
+
     nants = len(baseline2ref)
 
     if type(prms_0) is list:
@@ -295,10 +401,9 @@ def apply_phasenoise(visms, fconf, refant = 13, prms_0 = 1.0, nu_scale = None,
 
 def simobserve_phase(fconf, pwv, obstime, model_image = None,
                      phase_center = None, comps = None, nu_comp = None,
-                     mapsize = "", bandwidth = 8, refant = 13, prms_0 = 1.0,
-                     nu_scale = None, integration = '40s', prms_timescale = 1,
-                     verbose = False, plots = False, seed = 2021,
-                     overwrite = False, **kwargs):
+                     mapsize = "", bandwidth = 8, prms_0 = 1.0, nu_scale = None,
+                     integration = '40s', prms_timescale = 1, verbose = False,
+                     plots = False, seed = 2021, overwrite = False, **kwargs):
     """Function to simulate ALMA observations, including phase atmospheric
     noise.
 
@@ -332,9 +437,6 @@ def simobserve_phase(fconf, pwv, obstime, model_image = None,
         Total observing time to be used with simobserve in CASA.
       bandwidth:
         Bandwidth of model (either FITS file or component list), in GHz.
-      refant:
-        Index of antenna reference, with respect to the antennas
-        in configuration file. Default is 13.
       prms_0:
         (Optional) Factor to determine the phase rms at 10 km. It can be given
         as a float, in which case it will work as a factor scaling the phase
@@ -438,8 +540,7 @@ def simobserve_phase(fconf, pwv, obstime, model_image = None,
     ms_thermalnoise = '{}/{}.{}.noisy.ms'.format(
         project, project, os.path.basename(fconf)[:-4])
 
-    apply_phasenoise(ms_thermalnoise, fconf = fconf, refant = refant,
-                     prms_0 = prms_0, nu_scale = nu_scale,
+    apply_phasenoise(ms_thermalnoise, prms_0 = prms_0, nu_scale = nu_scale,
                      prms_timescale = prms_timescale, apply = True,
                      verbose = verbose, plots = plots, rng = rng)
 
